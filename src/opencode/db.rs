@@ -51,6 +51,19 @@ pub fn resolve_db(path: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// A one-line summary of a root session, for the picker list.
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub id: String,
+    pub title: String,
+    /// The working directory the session ran in (the "repo" the picker shows).
+    pub directory: String,
+    /// Number of direct child sessions (subagents) - a hint at graph richness.
+    pub subagents: i64,
+    /// Newest message time (epoch millis), for ordering and "last active".
+    pub last_active: i64,
+}
+
 /// A read-only handle to an opencode DB.
 pub struct OpencodeDb {
     conn: Connection,
@@ -106,6 +119,37 @@ impl OpencodeDb {
         )?;
         let mut rows = stmt.query([])?;
         Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+    }
+
+    /// List root sessions for the picker, most-recently-active first. When `dir`
+    /// is given, sessions for that directory sort first (so the project you are
+    /// in is at the top), then everything else - the picker still shows the whole
+    /// history so you can jump to another repo's session.
+    pub fn list_sessions(&self, dir: Option<&Path>, limit: usize) -> Result<Vec<SessionSummary>> {
+        let dir_str = dir.map(|d| d.to_string_lossy().to_string());
+        // last_active = newest message time, falling back to created time.
+        // Order: matching-directory first (when a dir is given), then by recency.
+        let sql = "select s.id, s.title, s.directory, \
+                (select count(*) from session c where c.parent_id = s.id) as subs, \
+                coalesce( \
+                    (select max(time_created) from message m where m.session_id = s.id), \
+                    s.time_created \
+                ) as last_active \
+             from session s where s.parent_id is null \
+             order by (case when ?1 is not null and s.directory = ?1 then 0 else 1 end) asc, \
+                      last_active desc \
+             limit ?2";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(rusqlite::params![dir_str, limit as i64], |r| {
+            Ok(SessionSummary {
+                id: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                directory: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                subagents: r.get(3)?,
+                last_active: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Load a single session's rows (metadata + messages + parts), ordered by

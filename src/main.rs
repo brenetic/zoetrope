@@ -61,7 +61,7 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
-    zoe --opencode          follow the current project's live opencode session
+    zoe --opencode          pick an opencode session (or follow the latest live)
     zoe --opencode <ses>    replay an opencode session by id
     zoe inspect <file>      headless: print the session tree + info
     zoe inspect --opencode <ses>   headless: print an opencode session tree
@@ -450,14 +450,26 @@ async fn run_tui_opencode(target: Option<PathBuf>, follow: bool, speed: f64) -> 
                 .ok_or_else(|| anyhow!("no opencode.db found in the default data dir"))?;
             (db, Some(id), None, follow)
         }
-        // No target → follow the newest session for the current directory.
+        // No target → show a picker (or follow the latest if the user chooses
+        // "Latest (live)"). Resolved below so the picker can run first.
         None => {
             let db = opencode::db::default_data_dir()
                 .map(|d| opencode::db::db_path(&d))
                 .filter(|p| p.is_file())
                 .ok_or_else(|| anyhow!("no opencode.db found in the default data dir"))?;
             let cwd = std::env::current_dir().ok();
-            (db, None, cwd, true)
+
+            // Open the DB and offer a picker. One session → skip the prompt;
+            // several → let the user choose (showing repo + last-active).
+            let handle = opencode::db::OpencodeDb::open(&db)?;
+            match opencode::picker::run(&handle, cwd.as_deref())? {
+                // Follow the newest for the cwd, with auto-switch (session_id None).
+                opencode::picker::Picked::Latest => (db, None, cwd, true),
+                // Replay a chosen session from the start (not live-follow).
+                opencode::picker::Picked::Session(id) => (db, Some(id), None, follow),
+                // Cancelled: exit without launching the graph.
+                opencode::picker::Picked::Cancelled => return Ok(()),
+            }
         }
     };
 

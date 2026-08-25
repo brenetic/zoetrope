@@ -15,6 +15,8 @@ pub mod translate;
 
 #[cfg(feature = "native")]
 pub mod db;
+#[cfg(feature = "native")]
+pub mod picker;
 
 use crate::state::SessionInfo;
 use crate::tailer::{DemoSubagent, ReplayItem, replay_from_session};

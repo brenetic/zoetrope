@@ -132,6 +132,21 @@ fn watermark_reflects_message_and_part_activity() {
 }
 
 #[test]
+fn list_sessions_returns_root_with_repo_and_subagent_count() {
+    // The picker relies on this: root sessions only, with directory (repo) and
+    // subagent count populated.
+    let db = OpencodeDb::open(&fixture_db()).expect("open fixture db");
+    let list = db.list_sessions(None, 50).expect("list");
+
+    assert_eq!(list.len(), 1, "fixture has one root session");
+    let s = &list[0];
+    assert_eq!(s.id, ROOT);
+    assert!(!s.directory.is_empty(), "directory (repo) is populated");
+    assert_eq!(s.subagents, 2, "the root spawned two subagents");
+    assert!(s.last_active > 0, "last_active is a real timestamp");
+}
+
+#[test]
 fn latest_session_lookup_finds_the_root() {
     let db = OpencodeDb::open(&fixture_db()).expect("open fixture db");
     let latest = db.latest_session().expect("query latest");
