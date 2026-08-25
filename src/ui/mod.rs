@@ -734,6 +734,21 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         Camera::Manual => {}
     }
 
+    // Following a live session that has gone quiet: explain the still screen so
+    // an idle-looking view reads as "waiting", not "broken". Only in Live mode
+    // (a replay's `Idle`/end is self-evident from the scrubber) and only once
+    // there is something on screen, so the pre-first-activity attach still says
+    // nothing rather than flashing a hint before the graph appears.
+    if app.mode == Mode::Live
+        && matches!(app.transport(), Transport::Idle)
+        && app.session.agent_count() > 0
+    {
+        left.push(Span::styled(
+            "  waiting for activity…",
+            bg.fg(palette.subtle).add_modifier(Modifier::ITALIC),
+        ));
+    }
+
     if let Some(err) = &app.last_error {
         left.push(Span::styled(
             format!("  ⚠ {}", truncate(err, 50)),

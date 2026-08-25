@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc;
 
+use zoetrope::opencode;
 use zoetrope::state::session::{AgentKind, SessionModel, ToolState};
 use zoetrope::state::{App, Mode};
-use zoetrope::tailer::{Source, TailRequest, UiEvent, Update};
+use zoetrope::tailer::{OpencodeTarget, Source, TailRequest, UiEvent, Update};
 use zoetrope::{tailer, transcript, tui};
 
 /// Channel capacity for the bounded request/event channels.
@@ -39,16 +40,20 @@ pub enum Cli {
         target: Option<PathBuf>,
         follow: bool,
         speed: f64,
+        /// Read from opencode's SQLite DB instead of Claude Code's JSONL. Auto-set
+        /// when the target looks like an opencode DB/data dir; forced by
+        /// `--opencode`.
+        opencode: bool,
     },
     /// Headless: parse and print the session tree + info; no TUI.
-    Inspect { file: PathBuf },
+    Inspect { file: PathBuf, opencode: bool },
 }
 
 /// Default replay speed multiplier.
 const DEFAULT_REPLAY_SPEED: f64 = 8.0;
 
 const USAGE: &str = "\
-zoetrope — visualize Claude Code agent sessions as a flow graph
+zoetrope — visualize Claude Code and opencode agent sessions as a flow graph
 
 USAGE:
     zoe                     follow the current project's live session
@@ -56,8 +61,14 @@ USAGE:
     zoe <dir>               follow another project's live session
     zoe <file> --follow     follow a file's live edge instead of replaying
     zoe <file> --speed N    playback speed (default 8.0)
+    zoe --opencode          pick an opencode session (or follow the latest live)
+    zoe --opencode <ses>    replay an opencode session by id
     zoe inspect <file>      headless: print the session tree + info
+    zoe inspect --opencode <ses>   headless: print an opencode session tree
     zoe --version           print the version and exit
+
+opencode is read from its local SQLite DB (~/.local/share/opencode/opencode.db),
+read-only. An opencode DB path or data dir as <target> is auto-detected.
 
 Once open, scrub/follow/pause/go-live are available no matter how you launched.";
 
@@ -66,24 +77,42 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
     // Skip argv[0].
     let mut args = args.skip(1).peekable();
 
-    // `inspect <file>` is the one distinct (headless) subcommand.
+    // `inspect <file>` is the one distinct (headless) subcommand. It accepts an
+    // optional `--opencode` flag and a single positional (a file, or an
+    // opencode session id / DB path).
     if args.peek().map(String::as_str) == Some("inspect") {
         args.next();
-        let file = args
-            .next()
-            .ok_or_else(|| anyhow!("inspect requires a <file.jsonl>\n\n{USAGE}"))?;
-        if args.next().is_some() {
-            bail!("inspect takes a single file argument\n\n{USAGE}");
+        let mut file: Option<String> = None;
+        let mut opencode = false;
+        for arg in args.by_ref() {
+            match arg.as_str() {
+                "--opencode" => opencode = true,
+                other if other.starts_with('-') => {
+                    bail!("unknown flag {other:?}\n\n{USAGE}");
+                }
+                _ => {
+                    if file.is_some() {
+                        bail!("inspect takes a single argument\n\n{USAGE}");
+                    }
+                    file = Some(arg);
+                }
+            }
         }
-        return Ok(Cli::Inspect {
-            file: PathBuf::from(file),
-        });
+        // A Claude inspect needs a file; an opencode inspect defaults to the
+        // latest session when no id is given.
+        let file = match file {
+            Some(f) => PathBuf::from(f),
+            None if opencode => PathBuf::new(),
+            None => bail!("inspect requires an argument\n\n{USAGE}"),
+        };
+        return Ok(Cli::Inspect { file, opencode });
     }
 
     // Otherwise: an optional positional target + flags.
     let mut target: Option<PathBuf> = None;
     let mut follow = false;
     let mut speed = DEFAULT_REPLAY_SPEED;
+    let mut opencode = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -97,6 +126,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
                 std::process::exit(0);
             }
             "--follow" => follow = true,
+            "--opencode" => opencode = true,
             "--speed" => {
                 let v = args
                     .next()
@@ -124,6 +154,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli> {
         target,
         follow,
         speed,
+        opencode,
     })
 }
 
@@ -220,7 +251,12 @@ fn collect_subagents(model: &mut SessionModel, dir: &Path, workflow: Option<&str
 /// Run the `inspect` subcommand: fully parse the session and print a tree to
 /// stdout. Returns an error (non-zero exit) on an unreadable file. This is the
 /// headless smoke test — no TTY required.
-async fn run_inspect(file: PathBuf) -> Result<()> {
+async fn run_inspect(file: PathBuf, opencode_flag: bool) -> Result<()> {
+    // opencode: `file` is a session id (or a DB path). Read from the DB.
+    if opencode_flag || opencode::db::is_opencode_target(&file) {
+        return run_inspect_opencode(file).await;
+    }
+
     if !file.is_file() {
         bail!("not a readable file: {}", file.display());
     }
@@ -250,6 +286,54 @@ async fn run_inspect(file: PathBuf) -> Result<()> {
     // Print roots first, then children indented underneath, in spawn order.
     print_agent_tree(&model, None, 0);
 
+    Ok(())
+}
+
+/// Headless inspect for an opencode session: resolve the DB, load the tree, and
+/// print the same agent tree the Claude path prints. `target` is a session id, a
+/// DB path, or a data dir.
+async fn run_inspect_opencode(target: PathBuf) -> Result<()> {
+    let target_str = target.to_string_lossy().to_string();
+
+    // Resolve the DB path: an explicit DB/dir target, else the default data dir.
+    let db_path = if opencode::db::is_opencode_target(&target) {
+        opencode::db::resolve_db(&target)
+            .ok_or_else(|| anyhow!("no opencode.db at {}", target.display()))?
+    } else {
+        opencode::db::default_data_dir()
+            .map(|d| opencode::db::db_path(&d))
+            .filter(|p| p.is_file())
+            .ok_or_else(|| anyhow!("no opencode.db found in the default data dir"))?
+    };
+
+    let db = opencode::db::OpencodeDb::open(&db_path)?;
+
+    // The session id: an explicit `ses_…` target, else the newest session for
+    // the current directory (falling back to newest overall) - the SAME
+    // resolution the TUI uses, so `inspect` and `--opencode` open the same
+    // session.
+    let session_id = if target_str.starts_with("ses_") {
+        target_str
+    } else {
+        let cwd = std::env::current_dir().ok();
+        let resolved = match cwd.as_deref() {
+            Some(d) => db.latest_session_for_dir(d)?,
+            None => db.latest_session()?,
+        };
+        resolved.ok_or_else(|| anyhow!("no opencode sessions found in {}", db_path.display()))?
+    };
+
+    let model = opencode::build_model(&db, &session_id)?
+        .ok_or_else(|| anyhow!("opencode session not found: {session_id}"))?;
+
+    println!("opencode session {} (opencode)", model.session_id);
+    println!(
+        "  {} agent(s), {} tool call(s)",
+        model.agent_count(),
+        model.tool_count(),
+    );
+    println!();
+    print_agent_tree(&model, None, 0);
     Ok(())
 }
 
@@ -337,6 +421,84 @@ fn print_agent_tree(model: &SessionModel, parent: Option<&str>, depth: usize) {
     }
 }
 
+/// Resolve an opencode `View` invocation and run the TUI over the opencode DB.
+///
+/// The `target` is interpreted as: an `opencode.db` file / data dir (follow the
+/// latest session for the cwd), or an opencode session id (`ses_…`) to replay.
+/// With no target, the newest session for the current directory is followed.
+async fn run_tui_opencode(target: Option<PathBuf>, follow: bool, speed: f64) -> Result<()> {
+    // Split the target into a DB path and an optional session id.
+    let (db_path, session_id, dir, do_follow) = match target {
+        // A DB file or data dir → follow the latest session for the cwd.
+        Some(p) if opencode::db::is_opencode_target(&p) => {
+            let db = opencode::db::resolve_db(&p)
+                .ok_or_else(|| anyhow!("no opencode.db at {}", p.display()))?;
+            let cwd = std::env::current_dir().ok();
+            (db, None, cwd, true)
+        }
+        // A session id (`ses_…`) → replay that session (follow only if asked).
+        Some(p) => {
+            let id = p.to_string_lossy().to_string();
+            if !id.starts_with("ses_") {
+                bail!(
+                    "not an opencode session id or DB: {id:?} (ids look like `ses_…`)\n\n{USAGE}"
+                );
+            }
+            let db = opencode::db::default_data_dir()
+                .map(|d| opencode::db::db_path(&d))
+                .filter(|p| p.is_file())
+                .ok_or_else(|| anyhow!("no opencode.db found in the default data dir"))?;
+            (db, Some(id), None, follow)
+        }
+        // No target → show a picker (or follow the latest if the user chooses
+        // "Latest (live)"). Resolved below so the picker can run first.
+        None => {
+            let db = opencode::db::default_data_dir()
+                .map(|d| opencode::db::db_path(&d))
+                .filter(|p| p.is_file())
+                .ok_or_else(|| anyhow!("no opencode.db found in the default data dir"))?;
+            let cwd = std::env::current_dir().ok();
+
+            // Open the DB and offer a picker. One session → skip the prompt;
+            // several → let the user choose (showing repo + last-active).
+            let handle = opencode::db::OpencodeDb::open(&db)?;
+            match opencode::picker::run(&handle, cwd.as_deref())? {
+                // Follow the newest for the cwd, with auto-switch (session_id None).
+                opencode::picker::Picked::Latest => (db, None, cwd, true),
+                // Replay a chosen session from the start (not live-follow).
+                opencode::picker::Picked::Session(id) => (db, Some(id), None, follow),
+                // Cancelled: exit without launching the graph.
+                opencode::picker::Picked::Cancelled => return Ok(()),
+            }
+        }
+    };
+
+    // Best-effort session id for the initial App identity (the feeder may
+    // resolve/switch it). An empty id is fine — events stamp the real one.
+    let initial_id = session_id.clone().unwrap_or_default();
+    let mode = if do_follow { Mode::Live } else { Mode::Replay };
+
+    let (tail_tx, tail_rx) = mpsc::channel::<TailRequest>(CHANNEL_CAP);
+    let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(CHANNEL_CAP);
+
+    let oc_target = OpencodeTarget {
+        db_path,
+        session_id,
+        dir,
+        follow: do_follow,
+        speed,
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = tailer::run_opencode_task(tail_rx, ui_tx.clone(), oc_target).await {
+            let _ = ui_tx.send(UiEvent::Error(e.to_string())).await;
+        }
+    });
+
+    let app = App::new(initial_id, mode);
+    tui::run(app, tail_tx, ui_rx).await
+}
+
 /// Resolve a `View` invocation into (session id, watch target, mode, feeder,
 /// speed), then spawn the tailer and run the TUI.
 ///
@@ -348,10 +510,21 @@ async fn run_tui(cli: Cli) -> Result<()> {
         target,
         follow,
         speed,
+        opencode,
     } = cli
     else {
         unreachable!("inspect handled in main");
     };
+
+    // opencode source: forced by `--opencode`, or auto-detected when the target
+    // is an opencode DB / data dir.
+    let use_opencode = opencode
+        || target
+            .as_deref()
+            .is_some_and(opencode::db::is_opencode_target);
+    if use_opencode {
+        return run_tui_opencode(target, follow, speed).await;
+    }
 
     let (session_id, watch_target, mode, replay, speed) = match target {
         // A concrete file → bulk-load + tail. Paced from the start unless
@@ -425,7 +598,7 @@ async fn main() -> Result<()> {
 
     let cli = parse_cli(std::env::args())?;
     match cli {
-        Cli::Inspect { file } => run_inspect(file).await,
+        Cli::Inspect { file, opencode } => run_inspect(file, opencode).await,
         other => run_tui(other).await,
     }
 }
@@ -489,6 +662,7 @@ mod tests {
                 target: Some(p),
                 follow,
                 speed,
+                ..
             } => {
                 assert_eq!(p, PathBuf::from("s.jsonl"));
                 assert_eq!(speed, 4.0);
@@ -525,9 +699,39 @@ mod tests {
     }
 
     #[test]
+    fn opencode_flag_sets_view_source() {
+        // Bare `--opencode` → follow the current project's opencode session.
+        match cli(&["--opencode"]).unwrap() {
+            Cli::View {
+                target: None,
+                opencode: true,
+                ..
+            } => {}
+            other => panic!("expected opencode View, got {other:?}"),
+        }
+        // `--opencode <ses>` carries the session id as the target.
+        match cli(&["--opencode", "ses_xyz"]).unwrap() {
+            Cli::View {
+                target: Some(p),
+                opencode: true,
+                ..
+            } => assert_eq!(p, PathBuf::from("ses_xyz")),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
     fn inspect_takes_one_file() {
         match cli(&["inspect", "s.jsonl"]).unwrap() {
-            Cli::Inspect { file } => assert_eq!(file, PathBuf::from("s.jsonl")),
+            Cli::Inspect { file, .. } => assert_eq!(file, PathBuf::from("s.jsonl")),
+            other => panic!("got {other:?}"),
+        }
+        // `--opencode` on inspect is accepted with a session-id argument.
+        match cli(&["inspect", "--opencode", "ses_abc"]).unwrap() {
+            Cli::Inspect { file, opencode } => {
+                assert_eq!(file, PathBuf::from("ses_abc"));
+                assert!(opencode);
+            }
             other => panic!("got {other:?}"),
         }
         assert!(cli(&["inspect"]).is_err());
