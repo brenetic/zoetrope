@@ -30,6 +30,7 @@ pub(crate) use item::Timing;
 #[cfg(test)]
 pub(crate) use item::date_and_sort;
 pub(crate) use item::date_and_sort_live;
+pub(crate) use item::entry_timestamp;
 pub use item::{DemoSubagent, replay_from_jsonl, replay_from_session};
 
 // Native-only feeders: incremental byte reading, live polling, replay assembly —

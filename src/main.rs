@@ -308,12 +308,19 @@ async fn run_inspect_opencode(target: PathBuf) -> Result<()> {
 
     let db = opencode::db::OpencodeDb::open(&db_path)?;
 
-    // The session id: an explicit `ses_…` target, else the latest overall.
+    // The session id: an explicit `ses_…` target, else the newest session for
+    // the current directory (falling back to newest overall) - the SAME
+    // resolution the TUI uses, so `inspect` and `--opencode` open the same
+    // session.
     let session_id = if target_str.starts_with("ses_") {
         target_str
     } else {
-        db.latest_session()?
-            .ok_or_else(|| anyhow!("no opencode sessions found in {}", db_path.display()))?
+        let cwd = std::env::current_dir().ok();
+        let resolved = match cwd.as_deref() {
+            Some(d) => db.latest_session_for_dir(d)?,
+            None => db.latest_session()?,
+        };
+        resolved.ok_or_else(|| anyhow!("no opencode sessions found in {}", db_path.display()))?
     };
 
     let model = opencode::build_model(&db, &session_id)?

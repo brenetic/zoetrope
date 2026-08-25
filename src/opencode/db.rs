@@ -70,31 +70,39 @@ impl OpencodeDb {
         Ok(Self { conn })
     }
 
-    /// The id of the newest root session whose `directory` matches `dir`
-    /// (the live-follow default for a project). Falls back to the newest root
-    /// session overall if none match.
+    /// The id of the most-recently-ACTIVE root session whose `directory` matches
+    /// `dir` (the live-follow default for a project). Ranked by newest message
+    /// time (not `session.time_created`), so `zoe --opencode` follows the session
+    /// you are actually working in right now, not merely the newest-created one.
+    /// Falls back to the most-recently-active root session overall if none match.
     pub fn latest_session_for_dir(&self, dir: &Path) -> Result<Option<String>> {
         let dir = dir.to_string_lossy().to_string();
+        // Rank by the newest message in the session, falling back to the
+        // session's own created time when it has no messages yet.
         let mut stmt = self.conn.prepare(
-            "select id from session where parent_id is null and directory = ?1 \
-             order by time_created desc limit 1",
+            "select s.id from session s where s.parent_id is null and s.directory = ?1 \
+             order by coalesce( \
+                 (select max(time_created) from message m where m.session_id = s.id), \
+                 s.time_created \
+             ) desc limit 1",
         )?;
         let mut rows = stmt.query([&dir])?;
         if let Some(row) = rows.next()? {
             return Ok(Some(row.get::<_, String>(0)?));
         }
-        // Fallback: newest root session anywhere.
-        let mut stmt = self.conn.prepare(
-            "select id from session where parent_id is null order by time_created desc limit 1",
-        )?;
-        let mut rows = stmt.query([])?;
-        Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
+        // Fallback: most-recently-active root session anywhere.
+        self.latest_session()
     }
 
-    /// The newest root session id overall.
+    /// The most-recently-active root session id overall (ranked by newest
+    /// message time, falling back to the session's created time).
     pub fn latest_session(&self) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "select id from session where parent_id is null order by time_created desc limit 1",
+            "select s.id from session s where s.parent_id is null \
+             order by coalesce( \
+                 (select max(time_created) from message m where m.session_id = s.id), \
+                 s.time_created \
+             ) desc limit 1",
         )?;
         let mut rows = stmt.query([])?;
         Ok(rows.next()?.map(|r| r.get::<_, String>(0)).transpose()?)
@@ -188,13 +196,29 @@ impl OpencodeDb {
         Ok(Some((root, children)))
     }
 
-    /// The high-water mark of activity across a session tree - the max
-    /// `time_updated` over the root and its children. The live poll compares
-    /// this against the last-seen value to decide whether to reload.
+    /// The high-water mark of activity across a session tree. The live poll
+    /// compares this against the last-seen value to decide whether to reload.
+    ///
+    /// Read from the `message` and `part` tables, NOT `session.time_updated` -
+    /// the session row's `time_updated` does not reliably advance when messages
+    /// or parts are written (observed stale by days on live sessions), so a
+    /// watermark based on it would freeze the live view. `part.time_updated`
+    /// tracks a tool flipping `running` → `completed`, which is exactly the
+    /// activity we want to catch.
     pub fn tree_watermark(&self, root_id: &str) -> Result<i64> {
+        // The set of session ids in the tree: the root plus its direct children.
+        // A single query over message+part scoped to those ids, taking the max
+        // of created/updated across both.
         let mut stmt = self.conn.prepare(
-            "select coalesce(max(time_updated), 0) from session \
-             where id = ?1 or parent_id = ?1",
+            "select max(w) from (\
+                 select coalesce(max(max(time_created), max(time_updated)), 0) as w \
+                 from message where session_id = ?1 or session_id in \
+                     (select id from session where parent_id = ?1) \
+                 union all \
+                 select coalesce(max(max(time_created), max(time_updated)), 0) as w \
+                 from part where session_id = ?1 or session_id in \
+                     (select id from session where parent_id = ?1)\
+             )",
         )?;
         let mut rows = stmt.query([root_id])?;
         Ok(rows
