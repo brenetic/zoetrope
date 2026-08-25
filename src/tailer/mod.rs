@@ -40,10 +40,16 @@ mod bytes;
 #[cfg(feature = "native")]
 mod live;
 #[cfg(feature = "native")]
+mod opencode;
+#[cfg(feature = "native")]
 mod replay;
 
 #[cfg(feature = "native")]
 use live::run_live;
+#[cfg(feature = "native")]
+pub use opencode::OpencodeTarget;
+#[cfg(feature = "native")]
+use opencode::run_opencode;
 #[cfg(feature = "native")]
 use replay::run_replay;
 
@@ -141,6 +147,24 @@ pub async fn run(
             Flow::Switch(path) => current = path,
             Flow::Exit => return Ok(()),
         }
+    }
+}
+
+/// Run the opencode feeder task: bulk-load a session tree from the opencode
+/// SQLite DB, hand it to the App, and (when `target.follow`) poll for changes.
+///
+/// A separate entry point from [`run`] because opencode's source is a DB, not a
+/// `PathBuf`-addressed JSONL file — so it takes a resolved [`OpencodeTarget`]
+/// rather than waiting on a [`TailRequest::Watch`]. It still emits the same
+/// [`UiEvent`]s, so the App is oblivious to which source produced them.
+#[cfg(feature = "native")]
+pub async fn run_opencode_task(
+    mut req_rx: mpsc::Receiver<TailRequest>,
+    ui_tx: mpsc::Sender<UiEvent>,
+    target: OpencodeTarget,
+) -> anyhow::Result<()> {
+    match run_opencode(target, &ui_tx, &mut req_rx).await {
+        Flow::Switch(_) | Flow::Exit => Ok(()),
     }
 }
 
